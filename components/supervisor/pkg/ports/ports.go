@@ -17,24 +17,10 @@ import (
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/supervisor/api"
+	"github.com/gitpod-io/gitpod/supervisor/pkg/gitpod"
+	"github.com/opencontainers/runc/libcontainer/configs"
 	"golang.org/x/xerrors"
 )
-
-// PortConfigProvider provides information about a port
-type PortConfigProvider interface {
-	// IsPublic returns true if the port is to be exposed publically
-	IsPublic(localPort uint32) (bool, error)
-}
-
-// FixedPortConfigProvider provides fixed configuration for ports
-type FixedPortConfigProvider struct {
-	Config map[uint32]bool
-}
-
-// IsPublic returns true if the port is to be exposed publically
-func (f *FixedPortConfigProvider) IsPublic(localPort uint32) (bool, error) {
-	return f.Config[localPort], nil
-}
 
 const (
 	// proxyPortRange is the port range in which we'll try to find
@@ -44,16 +30,16 @@ const (
 )
 
 // NewManager creates a new port manager
-func NewManager(exposed ExposedPortsInterface, served ServedPortsObserver, portConfig PortConfigProvider, internalPorts ...uint32) *Manager {
+func NewManager(exposed ExposedPortsInterface, served ServedPortsObserver, config ConfigInterface, internalPorts ...uint32) *Manager {
 	state := make(map[uint32]*managedPort)
 	for _, p := range internalPorts {
 		state[p] = &managedPort{Internal: true}
 	}
 
 	return &Manager{
-		E:          exposed,
-		S:          served,
-		PortConfig: portConfig,
+		E: exposed,
+		S: served,
+		C: config,
 
 		state:         state,
 		subscriptions: make(map[*Subscription]struct{}),
@@ -64,11 +50,12 @@ func NewManager(exposed ExposedPortsInterface, served ServedPortsObserver, portC
 // Manager brings together served and exposed ports. It keeps track of which port is exposed, which one is served,
 // auto-exposes ports and proxies ports served on localhost only.
 type Manager struct {
-	E          ExposedPortsInterface
-	S          ServedPortsObserver
-	PortConfig PortConfigProvider
+	E ExposedPortsInterface
+	S ServedPortsObserver
+	C ConfigInterface
 
 	state         map[uint32]*managedPort
+	configs       map[uint32]*gitpod.PortsItems
 	subscriptions map[*Subscription]struct{}
 	mu            sync.RWMutex
 	proxyStarter  func(dst *managedPort, openPorts map[uint32]struct{}) (err error)
@@ -121,6 +108,7 @@ func (pm *Manager) Run() {
 
 	exposedUpdates, exposedErrors := pm.E.Observe(ctx)
 	servedUpdates, servedErrors := pm.S.Observe(ctx)
+	configUpdates, configErrors := pm.C.Observe(ctx)
 	for {
 		select {
 		case e := <-exposedUpdates:
@@ -135,6 +123,8 @@ func (pm *Manager) Run() {
 				return
 			}
 			pm.updateStateWithServedPorts(s)
+		case configs := <-configUpdates:
+			pm.updateStateWithPortConfigs(configs)
 		case err := <-exposedErrors:
 			if err == nil {
 				log.Error("exposed ports observer stopped")
@@ -147,6 +137,12 @@ func (pm *Manager) Run() {
 				return
 			}
 			log.WithError(err).Warn("error while observing served ports")
+		case err := <-configErrors:
+			if err == nil {
+				log.Error("port configs observer stopped")
+				return
+			}
+			log.WithError(err).Warn("error while observing served port configs")
 		}
 	}
 }
@@ -157,6 +153,21 @@ func (pm *Manager) Status() []*api.PortsStatus {
 	defer pm.mu.RUnlock()
 
 	return pm.getStatus()
+}
+
+func (pm *Manager) updateStateWithPortConfigs(configs []*gitpod.PortsItems) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pm.configs = make(map[string]*gitpod.PortsItems)
+
+	for _, config := range pm.configs {
+		pm.configs[string(config.Port)] := config
+		mp, exists := pm.state[port]
+		if exists {
+			pm.autoExpose(mp)
+		}
+	}
 }
 
 func (pm *Manager) updateStateWithServedPorts(listeningPorts []ServedPort) {
@@ -224,17 +235,7 @@ func (pm *Manager) updateStateWithServedPorts(listeningPorts []ServedPort) {
 			mp.GlobalPort = p.Port
 		}
 
-		if !mp.Exposed && !mp.Internal && !mp.IsOurProxy {
-			public, err := pm.PortConfig.IsPublic(mp.LocalhostPort)
-			if err != nil {
-				log.WithError(err).WithField("port", *mp).Warn("cannot determine if port is public - assuming it's not")
-			}
-
-			err = pm.E.Expose(ctx, mp.LocalhostPort, mp.GlobalPort, public)
-			if err != nil {
-				log.WithError(err).WithField("port", *mp).Warn("cannot auto-expose port")
-			}
-		}
+		pm.autoExpose(mp)
 
 		pm.state[p.Port] = mp
 		changes = true
@@ -244,6 +245,17 @@ func (pm *Manager) updateStateWithServedPorts(listeningPorts []ServedPort) {
 		return
 	}
 	pm.publishStatus()
+}
+
+func (pm *Manager) autoExpose(mp *managedPort) {
+	if !mp.Exposed && !mp.Internal && !mp.IsOurProxy {
+		config, exists := pm.configs[string(mp.LocalhostPort)]
+		public := exists && config.Visibility != "private"
+		err = pm.E.Expose(ctx, mp.LocalhostPort, mp.GlobalPort, public)
+		if err != nil {
+			log.WithError(err).WithField("port", *mp).Warn("cannot auto-expose port")
+		}
+	}
 }
 
 func (pm *Manager) updateStateWithExposedPorts(ports []ExposedPort) {
